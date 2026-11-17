@@ -15,14 +15,18 @@ regression of r_h on three features of the launch
      ln(hour-1 channels)]
 
 with a Gaussian kernel on ln(hour-1 viewers) (bandwidth 1.5 in log units)
-so launches of a similar scale dominate the fit, and a small ridge penalty
-(1.0) on the slopes for stability when the target scale lies beyond the
-largest comparable (as GTA VI's will).  The forecast quantiles are
-lognormal around the fitted value, with the spread taken from the
-kernel-weighted residual standard deviation (times 0.9, calibrated by
-leave-one-out cross-validation over the comparables and by the four
-practice cases).  All quantiles are then multiplied by the target's own
-hour-1 print.
+so launches of a similar scale dominate the fit, and a ridge penalty
+(5.0) on the slopes for stability when the target scale lies beyond the
+largest comparable (as GTA VI's will).  Comparables carry a quality tier
+in their unlock note ("Tier: comparable / early-access-contaminated /
+weak / target-history"); contaminated and weak launches are downweighted
+to 0.5 and the target's own pre-release history is excluded outright,
+because early-access and free-to-play curves do not behave like a clean
+paid launch.  The forecast quantiles are lognormal around the fitted
+value, with the spread taken from the kernel-weighted residual standard
+deviation (times 0.85, calibrated by leave-one-out cross-validation over
+the comparables and by the four practice cases).  All quantiles are then
+multiplied by the target's own hour-1 print.
 
 Inputs:  $MAKEFUN_INPUT_DIR (default /input) holding <id>.in files,
 schema makefun/twitch-ccu-case/v1.
@@ -34,6 +38,7 @@ Deterministic, standard library only, no network, no randomness.
 import json
 import math
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -74,10 +79,30 @@ def norm_ppf(p):
 Z = tuple(norm_ppf(p) for p in LEVELS)
 
 # Tuned on the four practice cases + leave-one-out over the comparables.
+# Round 2 (Nov 17): ridge 5.0 + tier downweight + spread 0.85 beat round 1
+# (ridge 1.0, no tiers, spread 0.9) on practice (0.159 vs 0.166), LOO
+# (0.362 vs 0.363) and LOO over big launches (0.208 vs 0.215).
 KERNEL_BW = 1.5      # Gaussian kernel bandwidth on ln(hour-1 viewers)
-RIDGE_LAMBDA = 1.0   # ridge penalty on the slopes (intercept unpenalised)
-SPREAD_MULT = 0.9    # multiplier on the residual standard deviation
+RIDGE_LAMBDA = 5.0   # ridge penalty on the slopes (intercept unpenalised)
+SPREAD_MULT = 0.85   # multiplier on the residual standard deviation
 MIN_POOL = 8         # minimum comparables carrying an hour to fit it
+
+# Quality tiers parsed from each comparable's unlock note ("Tier: ...").
+# Unknown tiers get 0.3; the target's own history is never a comparable.
+TIER_WEIGHTS = {
+    "comparable": 1.0,
+    "weak": 0.5,
+    "early-access-contaminated": 0.5,
+    "target-history": 0.0,
+}
+
+
+def parse_tier(unlock_text):
+    """Tier annotation embedded in a comparable's unlock note."""
+    if not unlock_text:
+        return "unknown"
+    match = re.search(r"Tier:\s*([a-z\-]+)", unlock_text)
+    return match.group(1) if match else "unknown"
 
 
 def parse_ts(text):
@@ -144,6 +169,8 @@ def comparable_features(comp, curve, day_start):
         # trailing 7-day mean.  Mean-imputed when the history is missing.
         "ln_hype": math.log(v1 / mean_pre7) if mean_pre7 else 2.2,
         "ln_ch1": math.log(channels1) if channels1 else 7.5,
+        # Quality tier from the comparable's unlock note.
+        "tier": parse_tier(comp.get("unlock")),
     }
 
 
@@ -160,18 +187,21 @@ def fit_hour(pool, target_feat, hour):
     rows = []
     for curve, feat in pool:
         if hour in curve and 1 in curve:
+            tier_w = TIER_WEIGHTS.get(feat.get("tier", "unknown"), 0.3)
+            if tier_w == 0.0:
+                continue  # never learn from the target's own history
             rows.append((feature_vector(feat),
                          math.log(curve[hour] / curve[1]),
-                         feat["ln_v1"]))
+                         feat["ln_v1"], tier_w))
     if len(rows) < MIN_POOL:
         return None
     x0 = target_feat["ln_v1"]
-    weights = [math.exp(-0.5 * ((ln_v1 - x0) / KERNEL_BW) ** 2)
-               for _x, _y, ln_v1 in rows]
+    weights = [math.exp(-0.5 * ((ln_v1 - x0) / KERNEL_BW) ** 2) * tier_w
+               for _x, _y, ln_v1, tier_w in rows]
     k = len(rows[0][0])
     ata = [[0.0] * k for _ in range(k)]
     atb = [0.0] * k
-    for (x, y, _ln), w in zip(rows, weights):
+    for (x, y, _ln, _tw), w in zip(rows, weights):
         for a in range(k):
             atb[a] += w * x[a] * y
             for b in range(k):
@@ -183,7 +213,7 @@ def fit_hour(pool, target_feat, hour):
     mu = sum(b * t for b, t in zip(beta, target_x))
     total_w = sum(weights)
     var = 0.0
-    for (x, y, _ln), w in zip(rows, weights):
+    for (x, y, _ln, _tw), w in zip(rows, weights):
         fitted = sum(b * v for b, v in zip(beta, x))
         var += w * (y - fitted) ** 2
     sd = math.sqrt(max(var / total_w, 1e-6)) * SPREAD_MULT
